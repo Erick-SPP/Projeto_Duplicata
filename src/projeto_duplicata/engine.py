@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 from collections import defaultdict
@@ -79,18 +80,26 @@ def base_processor(
 def find_duplicates(
     root_directory: str | Path,
     processor: Callable[[Path], Optional[Dict[str, Any]]] = base_processor,
-    target_file: Optional[Path] = None
-) -> list[list[Path]]:
+    target_file: Optional[Path] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None
+) -> dict[str, Any]:
     """
     3-pass scanner that delegates hashing and verification policies
     to the active decorated processor chosen in the UI.
     """
+    t_start = time.perf_counter()
     root = Path(root_directory)
+    
 
     # PASS 1: Lightweight collection & size grouping
     size_map = defaultdict(list)
+    file_count = 0
+    
     for path in root.rglob('*'):
+        if is_cancelled and is_cancelled():
+            break
         if path.is_file() and not path.is_symlink():
+            file_count += 1
             try:
                 size_map[path.stat().st_size].append(path)
             except (PermissionError, OSError):
@@ -107,23 +116,30 @@ def find_duplicates(
             pass
 
     size_candidates = [files for size, files in size_map.items() if len(files) > 1 and size > 0]
+    t_pass1 = time.perf_counter()
 
     # PASS 2: Dynamic Decorated Dispatching Loop
     processed_candidates = defaultdict(list)
     verify_lookup: Dict[tuple[str, str], bool] = {}
 
     for file_list in size_candidates:
+        if is_cancelled and is_cancelled():
+            break
         for filepath in file_list:
             result = processor(filepath)
             if result and result.get("hash"):
                 key = (result["strategy"], result["hash"])
                 processed_candidates[key].append(result["path"])
                 verify_lookup[key] = result.get("verify_bytes", True)
+    
+    t_pass2 = time.perf_counter()
 
     # PASS 3: Conditional Verification & Grouping
     verified_duplicates: list[list[Path]] = []
 
     for key, file_list in processed_candidates.items():
+        if is_cancelled and is_cancelled():
+            break
         if len(file_list) <= 1:
             continue
 
@@ -147,6 +163,15 @@ def find_duplicates(
         for group in confirmed_groups:
             if len(group) > 1:
                 verified_duplicates.append(group)
-
-    return verified_duplicates
-
+        
+    t_pass3 = time.perf_counter()
+    
+    return {"duplicates": verified_duplicates,
+            "timings": {
+            "pass1_ms": (t_pass1 - t_start) * 1000,
+            "pass2_ms": (t_pass2 - t_pass1) * 1000,
+            "pass3_ms": (t_pass3 - t_pass2) * 1000,
+            "total_s": t_pass3 - t_start,
+            "files_scanned": file_count,
+            }
+           }
